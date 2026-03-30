@@ -174,6 +174,18 @@ async def _create_tables():
             last_updated TIMESTAMPTZ DEFAULT NOW()
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS fees_collected (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            trade_id UUID REFERENCES copy_trades(id),
+            gross_pnl DECIMAL(20,6) NOT NULL,
+            fee_pct DECIMAL(5,4) NOT NULL,
+            fee_amount DECIMAL(20,6) NOT NULL,
+            net_pnl DECIMAL(20,6) NOT NULL,
+            treasury_wallet VARCHAR(42) NOT NULL,
+            collected_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """,
     ]
 
     for table_sql in tables:
@@ -200,6 +212,8 @@ async def _create_indexes():
         "CREATE INDEX IF NOT EXISTS idx_copy_trades_market ON copy_trades (market)",
         "CREATE INDEX IF NOT EXISTS idx_wallets_master_score ON wallets_master (signal_score DESC)",
         "CREATE INDEX IF NOT EXISTS idx_backtest_results_status ON backtest_results (status)",
+        "CREATE INDEX IF NOT EXISTS idx_fees_collected_at ON fees_collected (collected_at)",
+        "CREATE INDEX IF NOT EXISTS idx_fees_trade_id ON fees_collected (trade_id)",
     ]
 
     for index_sql in indexes:

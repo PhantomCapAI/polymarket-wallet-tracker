@@ -287,14 +287,28 @@ class TradingService:
         else:
             pnl = (entry_price - exit_price) / entry_price * position_size
 
+        # Performance fee on profitable trades
+        fee_amount = 0.0
+        net_pnl = pnl
+        if pnl > 0:
+            fee_pct = settings.PERFORMANCE_FEE_PCT
+            fee_amount = pnl * fee_pct
+            net_pnl = pnl - fee_amount
+            await db.execute("""
+                INSERT INTO fees_collected (trade_id, gross_pnl, fee_pct, fee_amount, net_pnl, treasury_wallet)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, trade_id, pnl, fee_pct, fee_amount, net_pnl, settings.TREASURY_WALLET)
+            logger.info("Fee collected: $%.2f (%.0f%% of $%.2f profit) -> %s",
+                        fee_amount, fee_pct * 100, pnl, settings.TREASURY_WALLET)
+
         await db.execute("""
             UPDATE copy_trades
             SET exit_price = $1, pnl = $2, status = 'closed', closed_at = NOW()
             WHERE id = $3
-        """, exit_price, pnl, trade_id)
+        """, exit_price, net_pnl, trade_id)
 
         # Circuit breaker tracking
-        if pnl < 0:
+        if net_pnl < 0:
             self.consecutive_losses += 1
             if self.consecutive_losses >= CIRCUIT_BREAKER_LOSSES:
                 self.halted_until = datetime.utcnow() + timedelta(hours=CIRCUIT_BREAKER_HOURS)
@@ -309,13 +323,21 @@ class TradingService:
         else:
             self.consecutive_losses = 0
 
-        pnl_label = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+        net_label = f"+${net_pnl:,.2f}" if net_pnl >= 0 else f"-${abs(net_pnl):,.2f}"
+        fee_label = f" | Fee: ${fee_amount:,.2f}" if fee_amount > 0 else ""
         await self._send_telegram(
-            f"POSITION CLOSED\nTrade: {trade_id[:8]}...\nPnL: {pnl_label}\n"
+            f"POSITION CLOSED\nTrade: {trade_id[:8]}...\nNet PnL: {net_label}{fee_label}\n"
             f"Exit: {exit_price:.4f}"
         )
 
-        return {"success": True, "trade_id": trade_id, "pnl": pnl, "exit_price": exit_price}
+        return {
+            "success": True,
+            "trade_id": trade_id,
+            "gross_pnl": pnl,
+            "fee": fee_amount,
+            "net_pnl": net_pnl,
+            "exit_price": exit_price
+        }
 
     # ------------------------------------------------------------------ #
     # Price fetching (async via aiohttp)
@@ -356,6 +378,14 @@ class TradingService:
             FROM copy_trades
         """)
 
+        fees = await db.fetchrow("""
+            SELECT
+                COALESCE(SUM(fee_amount), 0) AS total_fees,
+                COALESCE(SUM(fee_amount) FILTER (WHERE collected_at >= CURRENT_DATE), 0) AS daily_fees,
+                COUNT(*) AS total_fee_events
+            FROM fees_collected
+        """)
+
         bankroll = await self._get_bankroll()
 
         return {
@@ -367,6 +397,13 @@ class TradingService:
             "exposure_pct": (float(row['total_exposure'] or 0) / bankroll * 100) if bankroll > 0 else 0,
             "halted": self._is_halted(),
             "halted_until": self.halted_until.isoformat() if self.halted_until else None,
+            "revenue": {
+                "total_fees_collected": float(fees['total_fees'] or 0),
+                "daily_fees": float(fees['daily_fees'] or 0),
+                "fee_events": int(fees['total_fee_events'] or 0),
+                "fee_pct": settings.PERFORMANCE_FEE_PCT * 100,
+                "treasury": settings.TREASURY_WALLET
+            }
         }
 
     # ------------------------------------------------------------------ #

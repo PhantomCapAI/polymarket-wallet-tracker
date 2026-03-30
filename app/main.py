@@ -197,6 +197,46 @@ async def update_settings(body: dict):
     return {"status": "updated", "note": "Runtime settings updated (non-persistent)"}
 
 
+@app.get("/revenue")
+async def revenue_stats():
+    """Revenue dashboard — all performance fees collected."""
+    summary = await db.fetchrow("""
+        SELECT
+            COALESCE(SUM(fee_amount), 0) AS total_fees,
+            COALESCE(SUM(fee_amount) FILTER (WHERE collected_at >= CURRENT_DATE), 0) AS today_fees,
+            COALESCE(SUM(fee_amount) FILTER (WHERE collected_at >= NOW() - INTERVAL '7 days'), 0) AS week_fees,
+            COALESCE(SUM(fee_amount) FILTER (WHERE collected_at >= NOW() - INTERVAL '30 days'), 0) AS month_fees,
+            COALESCE(SUM(gross_pnl), 0) AS total_gross_pnl,
+            COALESCE(SUM(net_pnl), 0) AS total_net_pnl,
+            COUNT(*) AS total_winning_trades
+        FROM fees_collected
+    """)
+    recent = await db.fetch("""
+        SELECT f.fee_amount, f.gross_pnl, f.net_pnl, f.fee_pct, f.collected_at,
+               c.source_wallet, c.market
+        FROM fees_collected f
+        JOIN copy_trades c ON f.trade_id = c.id
+        ORDER BY f.collected_at DESC LIMIT 20
+    """)
+    from config.settings import settings
+    return {
+        "treasury_wallet": settings.TREASURY_WALLET,
+        "fee_rate": f"{settings.PERFORMANCE_FEE_PCT * 100:.0f}%",
+        "lifetime": {
+            "total_fees": float(summary['total_fees'] or 0),
+            "total_gross_pnl": float(summary['total_gross_pnl'] or 0),
+            "total_net_pnl": float(summary['total_net_pnl'] or 0),
+            "winning_trades": int(summary['total_winning_trades'] or 0)
+        },
+        "periods": {
+            "today": float(summary['today_fees'] or 0),
+            "7d": float(summary['week_fees'] or 0),
+            "30d": float(summary['month_fees'] or 0)
+        },
+        "recent_fees": [dict(r) for r in recent] if recent else []
+    }
+
+
 @app.get("/markets")
 async def market_summary():
     rows = await db.fetch("SELECT * FROM market_summary ORDER BY total_volume DESC")

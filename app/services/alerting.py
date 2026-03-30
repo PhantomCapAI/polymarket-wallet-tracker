@@ -330,6 +330,21 @@ class AlertingService:
                     f" → ${float(worst_trade['pnl']):,.2f}\n"
                 )
 
+            # Revenue stats
+            daily_fees = await db.fetchval("""
+                SELECT COALESCE(SUM(fee_amount), 0) FROM fees_collected
+                WHERE collected_at::date = CURRENT_DATE
+            """)
+            total_fees = await db.fetchval("""
+                SELECT COALESCE(SUM(fee_amount), 0) FROM fees_collected
+            """)
+            if float(total_fees or 0) > 0:
+                msg += (
+                    f"\n💰 *Revenue*\n"
+                    f"*Fees today:* ${float(daily_fees or 0):,.2f}\n"
+                    f"*Total fees (all time):* ${float(total_fees or 0):,.2f}\n"
+                )
+
             await self.telegram.send_message(msg)
         except Exception as e:
             logger.error(f"Error sending daily summary: {e}")

@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # Backtest Mode
     BACKTEST_MODE: bool = False
 
+    # Revenue / Performance Fee
+    PERFORMANCE_FEE_PCT: float = 0.10  # 10% of profitable copy trade PnL
+    TREASURY_WALLET: str = "0x326939f264b1Daa0De941cD8BeFDa28F42A02d5C"
+
     model_config = {
         "env_file": ".env",
         "case_sensitive": True,

@@ -78,6 +78,16 @@ TABLE_SCHEMAS = {
         ("Created At", "created_at"),
         ("Closed At", "closed_at"),
     ],
+    "fees_collected": [
+        ("ID", "id"),
+        ("Trade ID", "trade_id"),
+        ("Gross PnL", "gross_pnl"),
+        ("Fee %", "fee_pct"),
+        ("Fee Amount", "fee_amount"),
+        ("Net PnL", "net_pnl"),
+        ("Treasury Wallet", "treasury_wallet"),
+        ("Collected At", "collected_at"),
+    ],
 }
 
 HEADER_FONT = Font(bold=True, color="FFFFFF")
