@@ -15,7 +15,9 @@ from app.api import (
     export,
     backtest,
     settings,
-    markets
+    markets,
+    health,
+    leaderboard
 )
 
 # Configure logging
@@ -29,11 +31,14 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up Polymarket Bot API...")
-    await db.connect()
-    logger.info("Database connection established")
-    
+    try:
+        await db.connect()
+        logger.info("Database connection established")
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down Polymarket Bot API...")
     await db.disconnect()
@@ -65,6 +70,7 @@ app.include_router(export.router, prefix="/api/export", tags=["export"])
 app.include_router(backtest.router, prefix="/api/backtest", tags=["backtest"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 app.include_router(markets.router, prefix="/api/markets", tags=["markets"])
+app.include_router(leaderboard.router, prefix="/api/leaderboard", tags=["leaderboard"])
 
 @app.get("/")
 async def root():
