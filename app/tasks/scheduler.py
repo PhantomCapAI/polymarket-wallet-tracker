@@ -1,9 +1,9 @@
-import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Optional
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
-from app.models.database import AsyncSessionLocal
+from app.models.database import db
 from app.services.data_pipeline import data_pipeline
 from app.services.wallet_scoring import wallet_scoring_service
 from app.services.alerting import alerting_service
@@ -11,130 +11,154 @@ from app.services.trading import trading_service
 
 logger = logging.getLogger(__name__)
 
+
 class TaskScheduler:
     def __init__(self):
-        self.running = False
-        self.tasks = []
-    
-    async def start(self):
-        """Start the task scheduler"""
-        if self.running:
-            return
-        
-        self.running = True
-        
-        # Schedule tasks
-        self.tasks = [
-            asyncio.create_task(self._data_update_loop()),
-            asyncio.create_task(self._wallet_scoring_loop()),
-            asyncio.create_task(self._alert_check_loop()),
-            asyncio.create_task(self._stop_loss_check_loop()),
-            asyncio.create_task(self._daily_summary_loop())
-        ]
-        
-        logger.info("Task scheduler started")
-    
-    async def stop(self):
-        """Stop the task scheduler"""
-        self.running = False
-        
-        for task in self.tasks:
-            task.cancel()
-        
-        await asyncio.gather(*self.tasks, return_exceptions=True)
-        self.tasks = []
-        
-        logger.info("Task scheduler stopped")
-    
-    async def _data_update_loop(self):
-        """Update data every 5 minutes"""
-        while self.running:
-            try:
-                async with AsyncSessionLocal() as db:
-                    await data_pipeline.update_wallet_data(db)
-                    await data_pipeline.update_trade_data(db)
-                    await data_pipeline.update_market_summaries(db)
-                
-                logger.info("Data update completed")
-                
-            except Exception as e:
-                logger.error(f"Error in data update loop: {e}")
-            
-            await asyncio.sleep(300)  # 5 minutes
-    
-    async def _wallet_scoring_loop(self):
-        """Update wallet scores every 10 minutes"""
-        while self.running:
-            try:
-                async with AsyncSessionLocal() as db:
-                    await wallet_scoring_service.batch_update_scores(db)
-                
-                logger.info("Wallet scoring completed")
-                
-            except Exception as e:
-                logger.error(f"Error in wallet scoring loop: {e}")
-            
-            await asyncio.sleep(600)  # 10 minutes
-    
-    async def _alert_check_loop(self):
-        """Check for alerts every 2 minutes"""
-        while self.running:
-            try:
-                async with AsyncSessionLocal() as db:
-                    alerts = await alerting_service.check_alert_conditions(db)
-                
-                if alerts:
-                    logger.info(f"Generated {len(alerts)} alerts")
-                
-            except Exception as e:
-                logger.error(f"Error in alert check loop: {e}")
-            
-            await asyncio.sleep(120)  # 2 minutes
-    
-    async def _stop_loss_check_loop(self):
-        """Check stop losses every minute"""
-        while self.running:
-            try:
-                async with AsyncSessionLocal() as db:
-                    closed_positions = await trading_service.check_stop_losses(db)
-                
-                if closed_positions:
-                    logger.info(f"Closed {len(closed_positions)} positions due to stop loss")
-                
-            except Exception as e:
-                logger.error(f"Error in stop loss check loop: {e}")
-            
-            await asyncio.sleep(60)  # 1 minute
-    
-    async def _daily_summary_loop(self):
-        """Send daily summary at 9 AM UTC"""
-        while self.running:
-            try:
-                now = datetime.utcnow()
-                next_run = now.replace(hour=9, minute=0, second=0, microsecond=0)
-                
-                if next_run <= now:
-                    next_run += timedelta(days=1)
-                
-                sleep_seconds = (next_run - now).total_seconds()
-                await asyncio.sleep(sleep_seconds)
-                
-                if self.running:
-                    async with AsyncSessionLocal() as db:
-                        await alerting_service.send_daily_pnl_summary(db)
-                    
-                    logger.info("Daily summary sent")
-                
-            except Exception as e:
-                logger.error(f"Error in daily summary loop: {e}")
+        self.scheduler = None  # type: AsyncIOScheduler | None
 
-# Global scheduler instance
+    def start(self):
+        """Create the APScheduler instance, register jobs, and start."""
+        self.scheduler = AsyncIOScheduler(timezone="UTC")
+
+        # ── Data ingestion: every 15 minutes ──────────────────────────
+        self.scheduler.add_job(
+            self._run_data_update,
+            trigger=IntervalTrigger(minutes=15),
+            id="data_update",
+            name="Fetch wallet and trade data from CLOB API",
+            replace_existing=True,
+            max_instances=1,
+        )
+
+        # ── Wallet scoring: every 15 minutes, offset by 5 min ────────
+        self.scheduler.add_job(
+            self._run_wallet_scoring,
+            trigger=CronTrigger(minute="5,20,35,50"),
+            id="wallet_scoring",
+            name="Re-score all tracked wallets",
+            replace_existing=True,
+            max_instances=1,
+        )
+
+        # ── Market summary: every hour ────────────────────────────────
+        self.scheduler.add_job(
+            self._run_market_summary,
+            trigger=IntervalTrigger(hours=1),
+            id="market_summary",
+            name="Aggregate market-level statistics",
+            replace_existing=True,
+            max_instances=1,
+        )
+
+        # ── Stop-loss monitor: every 60 seconds ──────────────────────
+        self.scheduler.add_job(
+            self._run_stop_loss_check,
+            trigger=IntervalTrigger(seconds=60),
+            id="stop_loss_check",
+            name="Check open positions for stop-loss triggers",
+            replace_existing=True,
+            max_instances=1,
+        )
+
+        # ── Alert checks: every 2 minutes ────────────────────────────
+        self.scheduler.add_job(
+            self._run_alert_check,
+            trigger=IntervalTrigger(minutes=2),
+            id="alert_check",
+            name="Check for convergence, conviction, and timing alerts",
+            replace_existing=True,
+            max_instances=1,
+        )
+
+        # ── Daily summary: midnight UTC ───────────────────────────────
+        self.scheduler.add_job(
+            self._run_daily_summary,
+            trigger=CronTrigger(hour=0, minute=0),
+            id="daily_summary",
+            name="Send daily P&L summary via Telegram",
+            replace_existing=True,
+            max_instances=1,
+        )
+
+        self.scheduler.start()
+        logger.info("TaskScheduler started with %d jobs", len(self.scheduler.get_jobs()))
+
+    def stop(self):
+        """Shut down the scheduler gracefully."""
+        if self.scheduler and self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+            logger.info("TaskScheduler stopped")
+
+    # ------------------------------------------------------------------
+    # Job wrappers — each catches its own errors so one failure never
+    # takes down the scheduler.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _run_data_update():
+        logger.info("[job:data_update] starting")
+        try:
+            await data_pipeline.initialize()
+            await data_pipeline.update_wallet_data(db)
+            await data_pipeline.update_trade_data(db)
+            logger.info("[job:data_update] finished")
+        except Exception as exc:
+            logger.error("[job:data_update] failed: %s", exc)
+
+    @staticmethod
+    async def _run_wallet_scoring():
+        logger.info("[job:wallet_scoring] starting")
+        try:
+            scored = await wallet_scoring_service.score_all_wallets()
+            logger.info("[job:wallet_scoring] scored %s wallets", scored)
+        except Exception as exc:
+            logger.error("[job:wallet_scoring] failed: %s", exc)
+
+    @staticmethod
+    async def _run_market_summary():
+        logger.info("[job:market_summary] starting")
+        try:
+            await data_pipeline.initialize()
+            await data_pipeline.update_market_summaries(db)
+            logger.info("[job:market_summary] finished")
+        except Exception as exc:
+            logger.error("[job:market_summary] failed: %s", exc)
+
+    @staticmethod
+    async def _run_stop_loss_check():
+        try:
+            await trading_service.monitor_trades()
+        except Exception as exc:
+            logger.error("[job:stop_loss_check] failed: %s", exc)
+
+    @staticmethod
+    async def _run_alert_check():
+        logger.info("[job:alert_check] starting")
+        try:
+            await alerting_service.check_all_alerts()
+            logger.info("[job:alert_check] finished")
+        except Exception as exc:
+            logger.error("[job:alert_check] failed: %s", exc)
+
+    @staticmethod
+    async def _run_daily_summary():
+        logger.info("[job:daily_summary] starting")
+        try:
+            await alerting_service.send_daily_summary()
+            logger.info("[job:daily_summary] finished")
+        except Exception as exc:
+            logger.error("[job:daily_summary] failed: %s", exc)
+
+
+# Global instance
 scheduler = TaskScheduler()
 
+
 async def start_scheduler():
-    """Start the background scheduler"""
-    await scheduler.start()
+    """Convenience function for lifespan startup."""
+    scheduler.start()
+
 
 async def stop_scheduler():
-    """Stop the background scheduler"""
-    await scheduler.stop()
+    """Convenience function for lifespan shutdown."""
+    scheduler.stop()

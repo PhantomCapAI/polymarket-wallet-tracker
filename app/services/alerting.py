@@ -1,302 +1,440 @@
-import asyncio
+import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 import uuid
 
 from app.models.database import db
-from app.models.alert import Alert, AlertConfig
+from app.models.alert import AlertConfig
 from app.utils.telegram_bot import TelegramBot
 from config.settings import settings
 
+logger = logging.getLogger(__name__)
+
+
 class AlertingService:
     def __init__(self):
-        self.telegram_bot = TelegramBot()
-        self.alert_config = AlertConfig()
-        
-    async def create_alert(self, wallet: str, event_type: str, confidence: str, signal_reason: str, market: str):
-        """Create and store an alert"""
+        self.telegram = TelegramBot()
+        self.config = AlertConfig()
+
+    # ------------------------------------------------------------------
+    # Orchestrator
+    # ------------------------------------------------------------------
+
+    async def check_all_alerts(self):
+        """Run every alert check in sequence."""
+        try:
+            await self.check_new_positions()
+            await self.check_convergence()
+            await self.check_conviction_spikes()
+            await self.check_timing_anomalies()
+        except Exception as e:
+            logger.error(f"Error in check_all_alerts: {e}")
+
+    # ------------------------------------------------------------------
+    # Detection: new positions by top-10 wallets
+    # ------------------------------------------------------------------
+
+    async def check_new_positions(self):
+        """Detect when any top-10-scored wallet enters a new position."""
+        try:
+            rows = await db.fetch("""
+                SELECT t.wallet, t.market, t.direction, t.entry_price, t.position_size,
+                       w.signal_score
+                FROM trades_log t
+                JOIN wallets_master w ON t.wallet = w.wallet
+                WHERE t.entry_time > NOW() - INTERVAL '15 minutes'
+                  AND t.exit_time IS NULL
+                  AND w.wallet IN (
+                      SELECT wallet FROM wallets_master
+                      ORDER BY signal_score DESC
+                      LIMIT 10
+                  )
+                ORDER BY w.signal_score DESC
+            """)
+
+            for row in rows:
+                already = await db.fetchrow("""
+                    SELECT 1 FROM alerts_log
+                    WHERE wallet = $1
+                      AND event_type = 'new_position'
+                      AND market = $2
+                      AND timestamp > NOW() - INTERVAL '1 hour'
+                """, row['wallet'], row['market'])
+
+                if already:
+                    continue
+
+                confidence = 'high' if float(row['signal_score']) >= 0.85 else 'medium'
+                reason = (
+                    f"Top-10 wallet opened {row['direction'].upper()} "
+                    f"${float(row['position_size']):,.2f} @ {float(row['entry_price']):.4f}"
+                )
+
+                await self.create_alert(
+                    row['wallet'], 'new_position', confidence, reason, row['market']
+                )
+        except Exception as e:
+            logger.error(f"Error in check_new_positions: {e}")
+
+    # ------------------------------------------------------------------
+    # Detection: convergence of high-score wallets on same market
+    # ------------------------------------------------------------------
+
+    async def check_convergence(self):
+        """Detect when multiple wallets with signal_score > 0.7 align on the same market."""
+        try:
+            rows = await db.fetch("""
+                SELECT t.market,
+                       COUNT(DISTINCT t.wallet) AS wallet_count,
+                       ARRAY_AGG(DISTINCT t.wallet) AS wallets,
+                       AVG(w.signal_score) AS avg_score
+                FROM trades_log t
+                JOIN wallets_master w ON t.wallet = w.wallet
+                WHERE w.signal_score > 0.7
+                  AND t.entry_time > NOW() - INTERVAL '1 hour'
+                  AND t.exit_time IS NULL
+                GROUP BY t.market
+                HAVING COUNT(DISTINCT t.wallet) >= $1
+            """, self.config.convergence_threshold)
+
+            for row in rows:
+                already = await db.fetchrow("""
+                    SELECT 1 FROM alerts_log
+                    WHERE event_type = 'convergence'
+                      AND market = $1
+                      AND timestamp > NOW() - INTERVAL '4 hours'
+                """, row['market'])
+
+                if already:
+                    continue
+
+                wallet_count = row['wallet_count']
+                avg_score = float(row['avg_score'])
+                confidence = 'high' if wallet_count >= 5 else 'medium'
+                wallets_list = row['wallets']
+
+                reason = (
+                    f"{wallet_count} high-signal wallets converged "
+                    f"(avg score {avg_score:.3f})"
+                )
+                await self.create_alert(
+                    f"{wallet_count}_wallets", 'convergence', confidence, reason, row['market']
+                )
+
+                # Dedicated convergence Telegram message
+                wallet_lines = "\n".join(
+                    f"  - `{w[:10]}...`" for w in wallets_list[:5]
+                )
+                extra = f"\n  - ...and {len(wallets_list) - 5} more" if len(wallets_list) > 5 else ""
+                msg = (
+                    f"🎯 *CONVERGENCE SIGNAL*\n\n"
+                    f"*Market:* {row['market']}\n"
+                    f"*Wallets aligned:* {wallet_count}\n"
+                    f"*Avg signal score:* {avg_score:.3f}\n"
+                    f"*Confidence:* {confidence.upper()}\n\n"
+                    f"*Wallets:*\n{wallet_lines}{extra}"
+                )
+                await self.telegram.send_message(msg)
+
+        except Exception as e:
+            logger.error(f"Error in check_convergence: {e}")
+
+    # ------------------------------------------------------------------
+    # Detection: conviction spikes (3x+ average position size)
+    # ------------------------------------------------------------------
+
+    async def check_conviction_spikes(self):
+        """Detect when a wallet's position is 3x+ its historical average."""
+        try:
+            rows = await db.fetch("""
+                SELECT t.wallet, t.market, t.position_size,
+                       w.avg_position_size, w.signal_score
+                FROM trades_log t
+                JOIN wallets_master w ON t.wallet = w.wallet
+                WHERE t.entry_time > NOW() - INTERVAL '1 hour'
+                  AND t.position_size > w.avg_position_size * $1
+                  AND w.avg_position_size > 0
+                  AND w.signal_score > $2
+            """, self.config.conviction_multiplier, self.config.min_signal_score)
+
+            for row in rows:
+                already = await db.fetchrow("""
+                    SELECT 1 FROM alerts_log
+                    WHERE wallet = $1
+                      AND event_type = 'conviction_spike'
+                      AND timestamp > NOW() - INTERVAL '2 hours'
+                """, row['wallet'])
+
+                if already:
+                    continue
+
+                multiplier = float(row['position_size']) / float(row['avg_position_size'])
+                confidence = 'high' if multiplier >= 5 else 'medium'
+                reason = (
+                    f"Position size {multiplier:.1f}x wallet average "
+                    f"(${float(row['position_size']):,.2f} vs avg "
+                    f"${float(row['avg_position_size']):,.2f})"
+                )
+
+                await self.create_alert(
+                    row['wallet'], 'conviction_spike', confidence, reason, row['market']
+                )
+        except Exception as e:
+            logger.error(f"Error in check_conviction_spikes: {e}")
+
+    # ------------------------------------------------------------------
+    # Detection: timing anomalies
+    # ------------------------------------------------------------------
+
+    async def check_timing_anomalies(self):
+        """Detect sudden improvements in timing edge for high-score wallets."""
+        try:
+            rows = await db.fetch("""
+                SELECT w.wallet, w.signal_score, w.timing_edge,
+                       COUNT(t.id) AS recent_trades
+                FROM wallets_master w
+                JOIN trades_log t ON w.wallet = t.wallet
+                WHERE w.timing_edge > 0.8
+                  AND w.signal_score > 0.8
+                  AND t.entry_time > NOW() - INTERVAL '24 hours'
+                GROUP BY w.wallet, w.signal_score, w.timing_edge
+                HAVING COUNT(t.id) >= 3
+            """)
+
+            for row in rows:
+                already = await db.fetchrow("""
+                    SELECT 1 FROM alerts_log
+                    WHERE wallet = $1
+                      AND event_type = 'timing_anomaly'
+                      AND timestamp > NOW() - INTERVAL '6 hours'
+                """, row['wallet'])
+
+                if already:
+                    continue
+
+                reason = (
+                    f"Timing edge {float(row['timing_edge']):.3f} with "
+                    f"{row['recent_trades']} trades in 24 h "
+                    f"(signal {float(row['signal_score']):.3f})"
+                )
+
+                await self.create_alert(
+                    row['wallet'], 'timing_anomaly', 'high', reason, 'timing_pattern'
+                )
+        except Exception as e:
+            logger.error(f"Error in check_timing_anomalies: {e}")
+
+    # ------------------------------------------------------------------
+    # Core: persist alert + send Telegram
+    # ------------------------------------------------------------------
+
+    async def create_alert(
+        self,
+        wallet: str,
+        event_type: str,
+        confidence: str,
+        signal_reason: str,
+        market: str,
+    ):
+        """Insert into alerts_log and send a Telegram notification."""
         try:
             alert_id = str(uuid.uuid4())
-            
             await db.execute("""
                 INSERT INTO alerts_log (id, wallet, event_type, confidence, signal_reason, market)
                 VALUES ($1, $2, $3, $4, $5, $6)
             """, alert_id, wallet, event_type, confidence, signal_reason, market)
-            
-            # Send Telegram notification
-            await self.send_telegram_alert(wallet, event_type, confidence, signal_reason, market)
-            
+
+            emoji_map = {
+                'high': '🔥', 'medium': '⚠️', 'low': 'ℹ️',
+            }
+            event_emoji_map = {
+                'new_position': '📈', 'convergence': '🎯',
+                'conviction_spike': '💪', 'timing_anomaly': '⚡',
+            }
+            c_emoji = emoji_map.get(confidence, '🔔')
+            e_emoji = event_emoji_map.get(event_type, '🔔')
+
+            msg = (
+                f"{c_emoji}{e_emoji} *{event_type.upper().replace('_', ' ')}*\n\n"
+                f"*Wallet:* `{wallet[:10]}...`\n"
+                f"*Market:* {market}\n"
+                f"*Confidence:* {confidence.upper()}\n"
+                f"*Reason:* {signal_reason}\n"
+                f"*Time:* {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            )
+            await self.telegram.send_message(msg)
         except Exception as e:
-            print(f"Error creating alert: {e}")
-    
-    async def send_telegram_alert(self, wallet: str, event_type: str, confidence: str, signal_reason: str, market: str):
-        """Send alert via Telegram bot"""
-        try:
-            message = self.format_alert_message(wallet, event_type, confidence, signal_reason, market)
-            await self.telegram_bot.send_message(message)
-        except Exception as e:
-            print(f"Error sending Telegram alert: {e}")
-    
-    def format_alert_message(self, wallet: str, event_type: str, confidence: str, signal_reason: str, market: str) -> str:
-        """Format alert message for Telegram"""
-        emoji_map = {
-            'high': '🔥',
-            'medium': '⚠️', 
-            'low': 'ℹ️',
-            'entry': '📈',
-            'alignment': '🎯',
-            'anomaly': '⚡',
-            'conviction': '💪'
-        }
-        
-        confidence_emoji = emoji_map.get(confidence, '')
-        event_emoji = emoji_map.get(event_type, '')
-        
-        message = f"{confidence_emoji} {event_emoji} **{event_type.upper()} SIGNAL**\n\n"
-        message += f"**Wallet:** `{wallet[:10]}...`\n"
-        message += f"**Market:** {market}\n"
-        message += f"**Confidence:** {confidence.upper()}\n"
-        message += f"**Reason:** {signal_reason}\n"
-        message += f"**Time:** {datetime.now().strftime('%H:%M:%S UTC')}"
-        
-        return message
-    
-    async def send_copy_trade_alert(self, trade_id: str, market: str, direction: str, position_size: float, confidence: str, signal_score: float):
-        """Send alert when copy trade is executed"""
-        try:
-            message = f"🤖 **COPY TRADE EXECUTED**\n\n"
-            message += f"**Trade ID:** `{trade_id[:8]}...`\n"
-            message += f"**Market:** {market}\n"
-            message += f"**Direction:** {direction.upper()}\n"
-            message += f"**Size:** ${position_size:,.2f}\n"
-            message += f"**Confidence:** {confidence.upper()}\n"
-            message += f"**Signal Score:** {signal_score:.3f}\n"
-            message += f"**Time:** {datetime.now().strftime('%H:%M:%S UTC')}"
-            
-            await self.telegram_bot.send_message(message)
-        except Exception as e:
-            print(f"Error sending copy trade alert: {e}")
-    
-    async def send_trade_closed_alert(self, trade_id: str, pnl: float, reason: str):
-        """Send alert when trade is closed"""
-        try:
-            pnl_emoji = "✅" if pnl > 0 else "❌"
-            
-            message = f"{pnl_emoji} **TRADE CLOSED**\n\n"
-            message += f"**Trade ID:** `{trade_id[:8]}...`\n"
-            message += f"**P&L:** ${pnl:,.2f}\n"
-            message += f"**Reason:** {reason}\n"
-            message += f"**Time:** {datetime.now().strftime('%H:%M:%S UTC')}"
-            
-            await self.telegram_bot.send_message(message)
-        except Exception as e:
-            print(f"Error sending trade closed alert: {e}")
-    
-    async def send_circuit_breaker_alert(self, consecutive_losses: int):
-        """Send alert when circuit breaker is triggered"""
-        try:
-            message = f"🚨 **CIRCUIT BREAKER ACTIVATED**\n\n"
-            message += f"**Consecutive Losses:** {consecutive_losses}\n"
-            message += f"**Trading Halted:** {settings.CIRCUIT_BREAKER_HOURS} hours\n"
-            message += f"**Time:** {datetime.now().strftime('%H:%M:%S UTC')}\n\n"
-            message += "All trading has been suspended for risk management."
-            
-            await self.telegram_bot.send_message(message)
-        except Exception as e:
-            print(f"Error sending circuit breaker alert: {e}")
-    
-    async def send_daily_limit_alert(self, daily_pnl: float):
-        """Send alert when daily loss limit is hit"""
-        try:
-            message = f"🛑 **DAILY LOSS LIMIT REACHED**\n\n"
-            message += f"**Daily P&L:** ${daily_pnl:,.2f}\n"
-            message += f"**Limit:** -{settings.DAILY_LOSS_LIMIT*100}% of bankroll\n"
-            message += f"**Time:** {datetime.now().strftime('%H:%M:%S UTC')}\n\n"
-            message += "All positions closed. Trading halted until tomorrow."
-            
-            await self.telegram_bot.send_message(message)
-        except Exception as e:
-            print(f"Error sending daily limit alert: {e}")
-    
-    async def send_convergence_alert(self, market: str, wallets: List[str], confidence: str):
-        """Send alert when multiple high-signal wallets converge on same market"""
-        try:
-            message = f"🎯 **CONVERGENCE SIGNAL**\n\n"
-            message += f"**Market:** {market}\n"
-            message += f"**Wallets Aligned:** {len(wallets)}\n"
-            message += f"**Confidence:** {confidence.upper()}\n"
-            message += f"**Time:** {datetime.now().strftime('%H:%M:%S UTC')}\n\n"
-            message += f"**Wallets:**\n"
-            
-            for wallet in wallets[:5]:  # Show max 5 wallets
-                message += f"• `{wallet[:10]}...`\n"
-            
-            if len(wallets) > 5:
-                message += f"• ...and {len(wallets) - 5} more"
-            
-            await self.telegram_bot.send_message(message)
-        except Exception as e:
-            print(f"Error sending convergence alert: {e}")
-    
+            logger.error(f"Error creating alert: {e}")
+
+    # ------------------------------------------------------------------
+    # Daily summary
+    # ------------------------------------------------------------------
+
     async def send_daily_summary(self):
-        """Send daily P&L summary at midnight UTC"""
+        """Send end-of-day PnL summary via Telegram."""
         try:
-            # Get daily stats
-            daily_trades = await db.fetchval("""
-                SELECT COUNT(*) FROM copy_trades 
-                WHERE created_at::date = CURRENT_DATE
-            """)
-            
-            daily_pnl = await db.fetchval("""
-                SELECT COALESCE(SUM(pnl), 0) FROM copy_trades 
-                WHERE status != 'open' AND closed_at::date = CURRENT_DATE
-            """)
-            
-            open_positions = await db.fetchval("""
-                SELECT COUNT(*) FROM copy_trades WHERE status = 'open'
-            """)
-            
             total_pnl = await db.fetchval("""
                 SELECT COALESCE(SUM(pnl), 0) FROM copy_trades WHERE status != 'open'
             """)
-            
-            # Get top performing wallet of the day
-            top_wallet = await db.fetchrow("""
-                SELECT w.wallet, w.signal_score 
-                FROM wallets_master w
-                ORDER BY w.signal_score DESC
-                LIMIT 1
+
+            daily_pnl = await db.fetchval("""
+                SELECT COALESCE(SUM(pnl), 0) FROM copy_trades
+                WHERE status != 'open' AND closed_at::date = CURRENT_DATE
             """)
-            
-            message = f"📊 **DAILY SUMMARY - {datetime.now().strftime('%Y-%m-%d')}**\n\n"
-            message += f"**Today's Trades:** {int(daily_trades or 0)}\n"
-            message += f"**Daily P&L:** ${float(daily_pnl or 0):,.2f}\n"
-            message += f"**Open Positions:** {int(open_positions or 0)}\n"
-            message += f"**Total P&L:** ${float(total_pnl or 0):,.2f}\n"
-            
-            if top_wallet:
-                message += f"\n**Top Wallet:** `{top_wallet['wallet'][:10]}...`\n"
-                message += f"**Signal Score:** {float(top_wallet['signal_score']):.3f}"
-            
-            await self.telegram_bot.send_message(message)
-            
-        except Exception as e:
-            print(f"Error sending daily summary: {e}")
-    
-    async def check_convergence_signals(self):
-        """Check for convergence signals - multiple high-score wallets on same market"""
-        try:
-            # Get recent trades by high-signal wallets
-            convergence_data = await db.fetch("""
-                SELECT t.market, COUNT(DISTINCT t.wallet) as wallet_count, 
-                       ARRAY_AGG(DISTINCT t.wallet) as wallets
-                FROM trades_log t
-                JOIN wallets_master w ON t.wallet = w.wallet
-                WHERE w.signal_score > 0.7 
-                AND t.entry_time > NOW() - INTERVAL '1 hour'
-                GROUP BY t.market
-                HAVING COUNT(DISTINCT t.wallet) >= $1
-            """, self.alert_config.convergence_threshold)
-            
-            for convergence in convergence_data:
-                market = convergence['market']
-                wallets = convergence['wallets']
-                wallet_count = convergence['wallet_count']
-                
-                # Check if we already alerted on this convergence
-                recent_alert = await db.fetchrow("""
-                    SELECT * FROM alerts_log 
-                    WHERE event_type = 'alignment' 
-                    AND market = $1 
-                    AND timestamp > NOW() - INTERVAL '4 hours'
-                """, market)
-                
-                if not recent_alert:
-                    confidence = 'high' if wallet_count >= 5 else 'medium'
-                    
-                    await self.create_alert(
-                        f"{wallet_count}_wallets",
-                        'alignment',
-                        confidence,
-                        f"{wallet_count} high-signal wallets converged on market",
-                        market
-                    )
-                    
-                    await self.send_convergence_alert(market, wallets, confidence)
-            
-        except Exception as e:
-            print(f"Error checking convergence signals: {e}")
-    
-    async def check_unusual_conviction(self):
-        """Check for unusual conviction trades (3x+ normal position size)"""
-        try:
-            # Get wallets with recent large trades
-            conviction_trades = await db.fetch("""
-                SELECT t.wallet, t.market, t.position_size, w.avg_position_size, w.signal_score
-                FROM trades_log t
-                JOIN wallets_master w ON t.wallet = w.wallet
-                WHERE t.entry_time > NOW() - INTERVAL '1 hour'
-                AND t.position_size > w.avg_position_size * $1
-                AND w.signal_score > $2
-                AND w.avg_position_size > 0
-            """, self.alert_config.conviction_multiplier, self.alert_config.min_signal_score)
-            
-            for trade in conviction_trades:
-                # Check if we already alerted on this wallet recently
-                recent_alert = await db.fetchrow("""
-                    SELECT * FROM alerts_log 
-                    WHERE wallet = $1 
-                    AND event_type = 'conviction' 
-                    AND timestamp > NOW() - INTERVAL '2 hours'
-                """, trade['wallet'])
-                
-                if not recent_alert:
-                    size_multiplier = trade['position_size'] / trade['avg_position_size']
-                    confidence = 'high' if size_multiplier >= 5 else 'medium'
-                    
-                    await self.create_alert(
-                        trade['wallet'],
-                        'conviction',
-                        confidence,
-                        f"Unusual conviction trade: {size_multiplier:.1f}x normal position size",
-                        trade['market']
-                    )
-            
-        except Exception as e:
-            print(f"Error checking unusual conviction: {e}")
-    
-    async def check_timing_anomalies(self):
-        """Check for unusual timing patterns that might indicate alpha"""
-        try:
-            # Get wallets with consistently early entries
-            timing_anomalies = await db.fetch("""
-                SELECT w.wallet, w.signal_score, COUNT(t.id) as recent_trades
-                FROM wallets_master w
-                JOIN trades_log t ON w.wallet = t.wallet
-                WHERE w.timing_edge = 'early'
-                AND w.signal_score > 0.8
-                AND t.entry_time > NOW() - INTERVAL '24 hours'
-                GROUP BY w.wallet, w.signal_score
-                HAVING COUNT(t.id) >= 3
+
+            daily_trades = await db.fetchval("""
+                SELECT COUNT(*) FROM copy_trades
+                WHERE created_at::date = CURRENT_DATE
             """)
-            
-            for anomaly in timing_anomalies:
-                # Check if we already alerted
-                recent_alert = await db.fetchrow("""
-                    SELECT * FROM alerts_log 
-                    WHERE wallet = $1 
-                    AND event_type = 'anomaly' 
-                    AND timestamp > NOW() - INTERVAL '6 hours'
-                """, anomaly['wallet'])
-                
-                if not recent_alert:
-                    await self.create_alert(
-                        anomaly['wallet'],
-                        'anomaly',
-                        'high',
-                        f"Consistently early entries: {anomaly['recent_trades']} trades in 24h",
-                        'timing_pattern'
-                    )
-            
+
+            open_positions = await db.fetchval("""
+                SELECT COUNT(*) FROM copy_trades WHERE status = 'open'
+            """)
+
+            portfolio_value = await db.fetchval("""
+                SELECT COALESCE(SUM(position_size), 0) FROM copy_trades WHERE status = 'open'
+            """)
+
+            best_trade = await db.fetchrow("""
+                SELECT market, pnl FROM copy_trades
+                WHERE status != 'open' AND closed_at::date = CURRENT_DATE
+                ORDER BY pnl DESC LIMIT 1
+            """)
+
+            worst_trade = await db.fetchrow("""
+                SELECT market, pnl FROM copy_trades
+                WHERE status != 'open' AND closed_at::date = CURRENT_DATE
+                ORDER BY pnl ASC LIMIT 1
+            """)
+
+            pnl_emoji = "✅" if float(daily_pnl or 0) >= 0 else "❌"
+            date_str = datetime.utcnow().strftime('%Y-%m-%d')
+
+            msg = (
+                f"📊 *DAILY SUMMARY — {date_str}*\n\n"
+                f"*Today's P&L:* {pnl_emoji} ${float(daily_pnl or 0):,.2f}\n"
+                f"*Total P&L (all time):* ${float(total_pnl or 0):,.2f}\n"
+                f"*Trades today:* {int(daily_trades or 0)}\n"
+                f"*Open positions:* {int(open_positions or 0)}\n"
+                f"*Open exposure:* ${float(portfolio_value or 0):,.2f}\n"
+            )
+
+            if best_trade and best_trade['pnl'] is not None:
+                msg += (
+                    f"\n*Best trade:* {best_trade['market']}"
+                    f" → ${float(best_trade['pnl']):,.2f}\n"
+                )
+            if worst_trade and worst_trade['pnl'] is not None:
+                msg += (
+                    f"*Worst trade:* {worst_trade['market']}"
+                    f" → ${float(worst_trade['pnl']):,.2f}\n"
+                )
+
+            await self.telegram.send_message(msg)
         except Exception as e:
-            print(f"Error checking timing anomalies: {e}")
+            logger.error(f"Error sending daily summary: {e}")
+
+    # ------------------------------------------------------------------
+    # Copy-trade lifecycle alerts
+    # ------------------------------------------------------------------
+
+    async def send_copy_trade_alert(self, trade_info: Dict[str, Any]):
+        """Alert when a copy trade is executed."""
+        try:
+            wallet = trade_info.get('source_wallet', 'unknown')
+            market = trade_info.get('market', 'unknown')
+            direction = trade_info.get('direction', '?')
+            size = float(trade_info.get('position_size', 0))
+            score = float(trade_info.get('signal_score', 0))
+            confidence = 'HIGH' if score >= settings.HIGH_CONFIDENCE_THRESHOLD else 'MEDIUM'
+
+            msg = (
+                f"🤖 *COPY TRADE EXECUTED*\n\n"
+                f"*Source wallet:* `{wallet[:10]}...`\n"
+                f"*Market:* {market}\n"
+                f"*Direction:* {direction.upper()}\n"
+                f"*Size:* ${size:,.2f}\n"
+                f"*Signal score:* {score:.3f}\n"
+                f"*Confidence:* {confidence}\n"
+                f"*Time:* {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+            )
+            await self.telegram.send_message(msg)
+        except Exception as e:
+            logger.error(f"Error sending copy trade alert: {e}")
+
+    async def send_trade_closed_alert(self, trade_info: Dict[str, Any]):
+        """Alert when a copy trade is closed, including P&L."""
+        try:
+            trade_id = str(trade_info.get('id', ''))
+            market = trade_info.get('market', 'unknown')
+            pnl = float(trade_info.get('pnl', 0))
+            reason = trade_info.get('reason', 'manual')
+            pnl_emoji = "✅" if pnl >= 0 else "❌"
+
+            msg = (
+                f"{pnl_emoji} *TRADE CLOSED*\n\n"
+                f"*Trade:* `{trade_id[:8]}...`\n"
+                f"*Market:* {market}\n"
+                f"*P&L:* ${pnl:,.2f}\n"
+                f"*Reason:* {reason}\n"
+                f"*Time:* {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+            )
+            await self.telegram.send_message(msg)
+        except Exception as e:
+            logger.error(f"Error sending trade closed alert: {e}")
+
+    # ------------------------------------------------------------------
+    # Risk alerts (stop-loss, daily limit, circuit breaker)
+    # ------------------------------------------------------------------
+
+    async def send_risk_alert(self, alert_type: str, details: Dict[str, Any]):
+        """Send risk-management alert (stop-loss, daily limit, circuit breaker)."""
+        try:
+            if alert_type == 'stop_loss':
+                trade_id = str(details.get('trade_id', ''))
+                market = details.get('market', 'unknown')
+                pnl = float(details.get('pnl', 0))
+                msg = (
+                    f"🛑 *STOP-LOSS TRIGGERED*\n\n"
+                    f"*Trade:* `{trade_id[:8]}...`\n"
+                    f"*Market:* {market}\n"
+                    f"*P&L:* ${pnl:,.2f}\n"
+                    f"*Time:* {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                )
+
+            elif alert_type == 'daily_limit':
+                daily_pnl = float(details.get('daily_pnl', 0))
+                limit_pct = settings.DAILY_LOSS_LIMIT * 100
+                msg = (
+                    f"🛑 *DAILY LOSS LIMIT REACHED*\n\n"
+                    f"*Daily P&L:* ${daily_pnl:,.2f}\n"
+                    f"*Limit:* -{limit_pct:.0f}% of bankroll\n"
+                    f"*Time:* {datetime.utcnow().strftime('%H:%M:%S UTC')}\n\n"
+                    f"All positions closed. Trading halted until tomorrow."
+                )
+
+            elif alert_type == 'circuit_breaker':
+                losses = int(details.get('consecutive_losses', 0))
+                hours = settings.CIRCUIT_BREAKER_HOURS
+                msg = (
+                    f"🚨 *CIRCUIT BREAKER ACTIVATED*\n\n"
+                    f"*Consecutive losses:* {losses}\n"
+                    f"*Trading halted:* {hours} hours\n"
+                    f"*Time:* {datetime.utcnow().strftime('%H:%M:%S UTC')}\n\n"
+                    f"All trading suspended for risk management."
+                )
+
+            else:
+                msg = (
+                    f"⚠️ *RISK ALERT — {alert_type.upper()}*\n\n"
+                    f"*Details:* {details}\n"
+                    f"*Time:* {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                )
+
+            await self.telegram.send_message(msg)
+        except Exception as e:
+            logger.error(f"Error sending risk alert ({alert_type}): {e}")
+
+
+# Global singleton
+alerting_service = AlertingService()

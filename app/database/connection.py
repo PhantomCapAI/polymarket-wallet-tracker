@@ -1,14 +1,12 @@
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.database import AsyncSessionLocal
+"""Database connection utilities.
 
-async def get_db() -> AsyncSession:
-    """Dependency to get database session"""
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+The primary database access is through app.models.database.db (asyncpg pool).
+This module provides compatibility helpers.
+"""
 
-def get_async_session_factory():
-    """Get async session factory"""
-    return AsyncSessionLocal
+from app.models.database import db
+
+
+async def get_db():
+    """FastAPI dependency — returns the global db instance."""
+    return db

@@ -5,12 +5,9 @@ aiohttp==3.9.1
 pydantic==2.5.0
 pydantic-settings==2.1.0
 python-multipart==0.0.6
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
 py-clob-client==0.14.0
-python-telegram-bot==20.7
-pandas==2.1.4
 numpy>=1.26.0
+pandas==2.1.4
 python-dotenv==1.0.0
 redis==5.0.1
 apscheduler==3.10.4
